@@ -1,0 +1,18 @@
+[package]
+name = "music_player"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rodio = "0.21"
+lofty = "0.22"
+walkdir = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+eframe = "0.31"
+egui = "0.31"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
