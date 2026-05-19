@@ -2,6 +2,7 @@ mod app;
 mod database;
 mod eq;
 mod library;
+mod mpris;
 mod player;
 
 use app::MusicPlayerApp;

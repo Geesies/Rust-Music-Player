@@ -2157,6 +2157,8 @@ dependencies = [
  "serde",
  "serde_json",
  "walkdir",
+ "zbus",
+ "zvariant",
 ]
 
 [[package]]

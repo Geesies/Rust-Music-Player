@@ -16,3 +16,5 @@ egui = "0.31"
 image = { version = "0.25", default-features = false, features = ["ico", "jpeg", "png"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+zbus = "4.4"
+zvariant = "4.2"

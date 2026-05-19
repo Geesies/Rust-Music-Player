@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    hash::{DefaultHasher, Hash, Hasher},
     ops::RangeInclusive,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -21,6 +23,7 @@ use crate::{
         art_bytes, load_album_metadata, rebuild_full_cache, scan_libraries, Album, AlbumMetadata,
         ArtSource, Artist, Song,
     },
+    mpris::{self, MediaCommand, MprisHandle, MprisState, PlaybackStatus},
     player::Player,
 };
 
@@ -154,6 +157,8 @@ pub struct MusicPlayerApp {
     search_visible: bool,
     search_query: String,
     search_cursor_to_end: bool,
+    media_command_rx: Receiver<MediaCommand>,
+    mpris: MprisHandle,
     settings: UiSettings,
     saved_settings: UiSettings,
 }
@@ -165,6 +170,8 @@ impl MusicPlayerApp {
         let (library_tx, library_rx) = mpsc::channel();
         let (art_tx, art_rx) = mpsc::channel();
         let (lyrics_tx, lyrics_rx) = mpsc::channel();
+        let (media_command_tx, media_command_rx) = mpsc::channel();
+        let mpris = mpris::start(media_command_tx);
         let library_paths = settings.library_paths.clone();
         thread::spawn(move || {
             let artists = scan_libraries(&library_paths);
@@ -202,6 +209,8 @@ impl MusicPlayerApp {
             search_visible: false,
             search_query: String::new(),
             search_cursor_to_end: false,
+            media_command_rx,
+            mpris,
             saved_settings,
             settings,
         }
@@ -465,6 +474,111 @@ impl MusicPlayerApp {
         }
     }
 
+    fn stop_playback(&mut self) {
+        self.player.pause();
+        self.is_playing = false;
+        self.status = "Stopped".to_string();
+    }
+
+    fn process_media_commands(&mut self) {
+        while let Ok(command) = self.media_command_rx.try_recv() {
+            match command {
+                MediaCommand::Play => {
+                    if self.now_playing.is_some() {
+                        self.player.resume();
+                        self.is_playing = true;
+                        self.status = "Playing".to_string();
+                    } else {
+                        self.play_selection();
+                    }
+                }
+                MediaCommand::Pause => {
+                    if self.now_playing.is_some() {
+                        self.player.pause();
+                        self.is_playing = false;
+                        self.status = "Paused".to_string();
+                    }
+                }
+                MediaCommand::PlayPause => {
+                    if self.now_playing.is_some() {
+                        self.toggle_pause();
+                    } else {
+                        self.play_selection();
+                    }
+                }
+                MediaCommand::Stop => self.stop_playback(),
+                MediaCommand::Next => self.play_next(),
+                MediaCommand::Previous => self.play_previous(),
+                MediaCommand::SeekRelative(offset) => {
+                    let current = self.player.position();
+                    let target = if offset.is_negative() {
+                        current.saturating_sub(Duration::from_micros(offset.unsigned_abs()))
+                    } else {
+                        current.saturating_add(Duration::from_micros(offset as u64))
+                    };
+                    self.seek_to_media_position(target);
+                }
+                MediaCommand::SeekAbsolute(position) => self.seek_to_media_position(position),
+            }
+        }
+    }
+
+    fn seek_to_media_position(&mut self, position: Duration) {
+        let target = self
+            .player
+            .duration()
+            .map(|duration| position.min(duration))
+            .unwrap_or(position);
+
+        if let Err(err) = self.player.seek(target) {
+            self.status = format!("Seek error: {err}");
+        }
+    }
+
+    fn publish_mpris_state(&self) {
+        let mut state = MprisState {
+            playback_status: if self.now_playing.is_none() {
+                PlaybackStatus::Stopped
+            } else if self.is_playing {
+                PlaybackStatus::Playing
+            } else {
+                PlaybackStatus::Paused
+            },
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            art_url: None,
+            duration: self.player.duration(),
+            position: self.player.position(),
+            can_play: true,
+            can_pause: self.now_playing.is_some(),
+            can_seek: self.player.duration().is_some(),
+        };
+
+        if let Some(song_ref) = self.now_playing {
+            if let Some(song) = self.song(song_ref) {
+                state.title = song.title.clone();
+                state.art_url = song
+                    .art
+                    .as_ref()
+                    .and_then(|art| mpris_art_url(art))
+                    .or_else(|| {
+                        self.album(song_ref.artist, song_ref.album)
+                            .and_then(|album| album.art.as_ref())
+                            .and_then(|art| mpris_art_url(art))
+                    });
+            }
+            if let Some(artist) = self.artists.get(song_ref.artist) {
+                state.artist = artist.name.clone();
+            }
+            if let Some(album) = self.album(song_ref.artist, song_ref.album) {
+                state.album = album.name.clone();
+            }
+        }
+
+        self.mpris.update(state);
+    }
+
     fn selected_song_context(&self) -> Option<(PathBuf, String, String)> {
         let song_ref = match self.now_playing {
             Some(song_ref) => song_ref,
@@ -681,6 +795,8 @@ impl MusicPlayerApp {
 
 impl eframe::App for MusicPlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_media_commands();
+
         if let Some(rx) = &self.library_rx {
             if let Ok(artists) = rx.try_recv() {
                 let artist_count = artists.len();
@@ -736,6 +852,7 @@ impl eframe::App for MusicPlayerApp {
         self.player.set_volume(self.volume);
         self.player
             .set_eq(self.settings.eq_enabled, self.settings.eq_bands.clone());
+        self.publish_mpris_state();
         apply_visuals(ctx, self.background_color());
 
         egui::CentralPanel::default()
@@ -2339,6 +2456,69 @@ fn load_art_image(art: &ArtSource) -> Option<ColorImage> {
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_raw();
     Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn mpris_art_url(art: &ArtSource) -> Option<String> {
+    match art {
+        ArtSource::File(path) => file_url(path),
+        ArtSource::Embedded(_) | ArtSource::Folder(_) => cached_mpris_art_url(art),
+    }
+}
+
+fn cached_mpris_art_url(art: &ArtSource) -> Option<String> {
+    let bytes = art_bytes(art)?;
+    let extension = image_extension(&bytes);
+    let key = hashed_art_key(art);
+    let path = settings_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("mpris-art")
+        .join(format!("{key}.{extension}"));
+
+    if !path.is_file() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok()?;
+        }
+        fs::write(&path, bytes).ok()?;
+    }
+
+    file_url(&path)
+}
+
+fn image_extension(bytes: &[u8]) -> &'static str {
+    match image::guess_format(bytes).ok() {
+        Some(image::ImageFormat::Png) => "png",
+        Some(image::ImageFormat::Jpeg) => "jpg",
+        Some(image::ImageFormat::Gif) => "gif",
+        Some(image::ImageFormat::WebP) => "webp",
+        Some(image::ImageFormat::Bmp) => "bmp",
+        Some(image::ImageFormat::Ico) => "ico",
+        _ => "img",
+    }
+}
+
+fn hashed_art_key(art: &ArtSource) -> String {
+    let mut hasher = DefaultHasher::new();
+    art_key(art).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn file_url(path: &Path) -> Option<String> {
+    let path = path.canonicalize().ok()?;
+    Some(format!("file://{}", percent_encode_path(&path)))
+}
+
+fn percent_encode_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn load_control_icon_image(icon: ControlIcon) -> Option<ColorImage> {
