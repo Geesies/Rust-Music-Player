@@ -8,8 +8,8 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Color32, ColorImage, CornerRadius, FontId, Frame, Id, Image, Layout, Pos2, Rect,
-    RichText, Sense, Stroke, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
+    self, Align, Color32, ColorImage, CornerRadius, FontId, Frame, Id, Image, Key, Layout, Pos2,
+    Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2,
 };
 use rand::{seq::SliceRandom, thread_rng};
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,7 @@ struct UiSettings {
     inside_spacing: f32,
     outside_spacing: f32,
     lyrics_file_path: String,
+    active_lyric_rgba: [u8; 4],
     eq_enabled: bool,
     eq_bands: Vec<EqBand>,
     eq_profiles: Vec<EqProfile>,
@@ -84,6 +85,22 @@ struct LyricsLoadResult {
     status: String,
 }
 
+#[derive(Clone, Copy)]
+enum SearchResult {
+    Artist(usize),
+    Album(usize, usize),
+    Song(usize, usize, usize),
+}
+
+#[derive(Clone, Copy)]
+enum ControlIcon {
+    Play,
+    Pause,
+    Previous,
+    Next,
+    Shuffle,
+}
+
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
@@ -99,6 +116,7 @@ impl Default for UiSettings {
             inside_spacing: 18.0,
             outside_spacing: 12.0,
             lyrics_file_path: String::new(),
+            active_lyric_rgba: [101, 216, 220, 255],
             eq_enabled: false,
             eq_bands: default_eq_bands(),
             eq_profiles: Vec::new(),
@@ -133,6 +151,9 @@ pub struct MusicPlayerApp {
     pending_lyrics: Option<PathBuf>,
     lyrics_tx: mpsc::Sender<LyricsLoadResult>,
     lyrics_rx: Receiver<LyricsLoadResult>,
+    search_visible: bool,
+    search_query: String,
+    search_cursor_to_end: bool,
     settings: UiSettings,
     saved_settings: UiSettings,
 }
@@ -178,6 +199,9 @@ impl MusicPlayerApp {
             pending_lyrics: None,
             lyrics_tx,
             lyrics_rx,
+            search_visible: false,
+            search_query: String::new(),
+            search_cursor_to_end: false,
             saved_settings,
             settings,
         }
@@ -339,10 +363,10 @@ impl MusicPlayerApp {
 
         self.queue = queue;
         self.queue_index = play_index;
-        self.play_queue_index(play_index);
+        self.play_queue_index(play_index, true);
     }
 
-    fn play_queue_index(&mut self, index: usize) {
+    fn play_queue_index(&mut self, index: usize, navigate: bool) {
         let Some(song_ref) = self.queue.get(index).copied() else {
             return;
         };
@@ -363,12 +387,16 @@ impl MusicPlayerApp {
             Ok(_) => {
                 self.queue_index = index;
                 self.now_playing = Some(song_ref);
-                self.selection = Some(Selection::Song(
-                    song_ref.artist,
-                    song_ref.album,
-                    song_ref.song,
-                ));
-                self.center_view = CenterView::Songs(song_ref.artist, song_ref.album);
+                if navigate {
+                    self.selection = Some(Selection::Song(
+                        song_ref.artist,
+                        song_ref.album,
+                        song_ref.song,
+                    ));
+                    self.center_view = CenterView::Songs(song_ref.artist, song_ref.album);
+                    self.search_visible = false;
+                    self.search_query.clear();
+                }
                 self.is_playing = true;
                 self.status = format!("Playing {title}");
                 self.ensure_lyrics_for_selection();
@@ -392,7 +420,22 @@ impl MusicPlayerApp {
             0
         };
 
-        self.play_queue_index(next);
+        self.play_queue_index(next, true);
+    }
+
+    fn play_next_without_navigation(&mut self) {
+        if self.queue.is_empty() {
+            self.play_selection();
+            return;
+        }
+
+        let next = if self.queue_index + 1 < self.queue.len() {
+            self.queue_index + 1
+        } else {
+            0
+        };
+
+        self.play_queue_index(next, false);
     }
 
     fn play_previous(&mut self) {
@@ -407,7 +450,7 @@ impl MusicPlayerApp {
             self.queue.len() - 1
         };
 
-        self.play_queue_index(previous);
+        self.play_queue_index(previous, true);
     }
 
     fn toggle_pause(&mut self) {
@@ -618,6 +661,10 @@ impl MusicPlayerApp {
         rgba(self.settings.accent_rgba)
     }
 
+    fn active_lyric_color(&self) -> Color32 {
+        rgba(self.settings.active_lyric_rgba)
+    }
+
     fn window_rounding(&self) -> CornerRadius {
         CornerRadius::same(self.settings.window_rounding.clamp(0.0, 64.0) as u8)
     }
@@ -680,11 +727,15 @@ impl eframe::App for MusicPlayerApp {
             self.saved_settings = self.settings.clone();
         }
 
+        self.handle_search_input(ctx);
+
         if self.is_playing && self.player.is_finished() {
-            self.play_next();
+            self.play_next_without_navigation();
         }
 
         self.player.set_volume(self.volume);
+        self.player
+            .set_eq(self.settings.eq_enabled, self.settings.eq_bands.clone());
         apply_visuals(ctx, self.background_color());
 
         egui::CentralPanel::default()
@@ -807,13 +858,209 @@ impl MusicPlayerApp {
             });
     }
 
+    fn handle_search_input(&mut self, ctx: &egui::Context) {
+        if self.search_visible {
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                self.close_search();
+            }
+            return;
+        }
+
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+
+        let typed = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Text(text)
+                    if text
+                        .chars()
+                        .any(|ch| !ch.is_control() && !ch.is_whitespace()) =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+        });
+
+        if let Some(text) = typed {
+            self.search_visible = true;
+            self.search_query = text;
+            self.search_cursor_to_end = true;
+        }
+    }
+
+    fn close_search(&mut self) {
+        self.search_visible = false;
+        self.search_query.clear();
+        self.search_cursor_to_end = false;
+    }
+
     fn center_panel(&mut self, ui: &mut Ui) {
+        if self.search_visible {
+            self.search_panel(ui);
+            return;
+        }
+
         match self.center_view {
             CenterView::Artists => self.artist_overview(ui),
             CenterView::Albums(artist) => self.album_grid(ui, artist),
             CenterView::Songs(artist, album) => self.song_list(ui, artist, album),
             CenterView::Settings => self.settings_panel(ui),
         }
+    }
+
+    fn search_panel(&mut self, ui: &mut Ui) {
+        self.search_header(ui);
+
+        let results = self.search_results();
+        egui::ScrollArea::vertical()
+            .id_salt("search_results_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.search_query.trim().is_empty() {
+                    return;
+                }
+
+                for (result, label) in results {
+                    let selected = match result {
+                        SearchResult::Artist(artist) => {
+                            matches!(self.selection, Some(Selection::Artist(value)) if value == artist)
+                        }
+                        SearchResult::Album(artist, album) => {
+                            matches!(self.selection, Some(Selection::Album(a, b)) if a == artist && b == album)
+                        }
+                        SearchResult::Song(artist, album, song) => {
+                            matches!(self.selection, Some(Selection::Song(a, b, s)) if a == artist && b == album && s == song)
+                        }
+                    };
+                    let response = selectable_row(
+                        ui,
+                        &label,
+                        selected,
+                        self.font_color(),
+                        self.accent_color(),
+                    );
+
+                    if response.clicked() {
+                        self.open_search_result(result);
+                    }
+
+                    if response.double_clicked() {
+                        self.play_search_result(result);
+                    }
+                }
+            });
+    }
+
+    fn search_header(&mut self, ui: &mut Ui) {
+        let rect = Rect::from_min_size(
+            ui.max_rect().min - Vec2::new(14.0, 74.0),
+            Vec2::new(ui.max_rect().width() + 28.0, 62.0),
+        );
+        let input_rect = rect.shrink2(Vec2::new(18.0, 10.0));
+
+        ui.allocate_new_ui(
+            UiBuilder::new()
+                .id_salt("search_header")
+                .max_rect(input_rect),
+            |ui| {
+                let mut output = egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("Search")
+                    .font(egui::TextStyle::Heading)
+                    .desired_width(input_rect.width())
+                    .show(ui);
+                output.response.request_focus();
+
+                if self.search_cursor_to_end {
+                    let end = self.search_query.chars().count();
+                    output
+                        .state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::one(
+                            egui::text::CCursor::new(end),
+                        )));
+                    output.state.store(ui.ctx(), output.response.id);
+                    self.search_cursor_to_end = false;
+                }
+            },
+        );
+
+        ui.add_space(2.0);
+    }
+
+    fn search_results(&self) -> Vec<(SearchResult, String)> {
+        let query = self.search_query.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = Vec::new();
+
+        for (artist_index, artist) in self.artists.iter().enumerate() {
+            if artist.name.to_lowercase().contains(&query) {
+                results.push((
+                    SearchResult::Artist(artist_index),
+                    format!("Artist  {}", artist.name),
+                ));
+            }
+        }
+
+        for (artist_index, artist) in self.artists.iter().enumerate() {
+            for (album_index, album) in artist.albums.iter().enumerate() {
+                if album.name.to_lowercase().contains(&query) {
+                    results.push((
+                        SearchResult::Album(artist_index, album_index),
+                        format!("Album   {} | {}", artist.name, album.name),
+                    ));
+                }
+            }
+        }
+
+        for (artist_index, artist) in self.artists.iter().enumerate() {
+            for (album_index, album) in artist.albums.iter().enumerate() {
+                for (song_index, song) in album.songs.iter().enumerate() {
+                    if song.title.to_lowercase().contains(&query) {
+                        results.push((
+                            SearchResult::Song(artist_index, album_index, song_index),
+                            format!("Song    {} | {}", artist.name, song.title),
+                        ));
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    fn open_search_result(&mut self, result: SearchResult) {
+        match result {
+            SearchResult::Artist(artist) => {
+                self.selection = Some(Selection::Artist(artist));
+                self.center_view = CenterView::Albums(artist);
+            }
+            SearchResult::Album(artist, album) => {
+                self.open_album(artist, album);
+            }
+            SearchResult::Song(artist, album, song) => {
+                self.ensure_album_metadata(artist, album);
+                self.selection = Some(Selection::Song(artist, album, song));
+                self.center_view = CenterView::Songs(artist, album);
+            }
+        }
+        self.close_search();
+    }
+
+    fn play_search_result(&mut self, result: SearchResult) {
+        match result {
+            SearchResult::Artist(artist) => self.play_artist(artist),
+            SearchResult::Album(artist, album) => self.play_album(artist, album),
+            SearchResult::Song(artist, album, song) => {
+                self.ensure_album_metadata(artist, album);
+                self.play_song_scope(artist, album, song);
+            }
+        }
+        self.close_search();
     }
 
     fn center_header(&mut self, ui: &mut Ui, title: &str, back_to: Option<CenterView>) {
@@ -1114,14 +1361,14 @@ impl MusicPlayerApp {
             ui.horizontal(|ui| {
                 ui.label(format!("Band {}", index + 1));
                 ui.add(
+                    egui::Slider::new(&mut self.settings.eq_bands[index].gain_db, -18.0..=18.0)
+                        .text("gain dB"),
+                );
+                ui.add(
                     egui::DragValue::new(&mut self.settings.eq_bands[index].frequency_hz)
                         .range(20.0..=20_000.0)
                         .speed(10.0)
                         .suffix(" Hz"),
-                );
-                ui.add(
-                    egui::Slider::new(&mut self.settings.eq_bands[index].gain_db, -18.0..=18.0)
-                        .text("gain dB"),
                 );
                 ui.add(
                     egui::DragValue::new(&mut self.settings.eq_bands[index].q)
@@ -1149,6 +1396,16 @@ impl MusicPlayerApp {
                 self.settings.eq_bands = default_eq_bands();
             }
         });
+
+        ui.add_space(8.0);
+        let analyzer = self.player.analyzer_snapshot();
+        paint_eq_histogram(
+            ui,
+            &analyzer.samples,
+            analyzer.sample_rate,
+            self.is_playing,
+            self.font_color(),
+        );
 
         ui.add_space(8.0);
         ui.label(
@@ -1228,7 +1485,7 @@ impl MusicPlayerApp {
         }
 
         ui.label(
-            RichText::new("EQ changes apply when playback starts or the next track begins.")
+            RichText::new("EQ changes update live during playback.")
                 .size(14.0)
                 .color(self.font_color()),
         );
@@ -1369,7 +1626,26 @@ impl MusicPlayerApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if let Some(lyrics) = &self.lyrics_text {
-                    ui.label(RichText::new(lyrics).size(16.0).color(self.font_color()));
+                    let synced_lines = parse_synced_lyrics(lyrics);
+                    if synced_lines.is_empty() {
+                        ui.label(RichText::new(lyrics).size(16.0).color(self.font_color()));
+                    } else {
+                        let position = self.player.position().as_secs_f32();
+                        let active_index = active_lyric_line(&synced_lines, position);
+                        for (index, (_, line)) in synced_lines.iter().enumerate() {
+                            let active = Some(index) == active_index;
+                            let color = if active {
+                                self.active_lyric_color()
+                            } else {
+                                self.font_color()
+                            };
+                            let size = if active { 18.0 } else { 15.0 };
+                            let response = ui.label(RichText::new(line).size(size).color(color));
+                            if active {
+                                ui.scroll_to_rect(response.rect, Some(Align::Center));
+                            }
+                        }
+                    }
                 } else {
                     ui.label(
                         RichText::new(&self.lyrics_status)
@@ -1387,6 +1663,7 @@ impl MusicPlayerApp {
                 .color(self.font_color()),
         );
         ui.text_edit_singleline(&mut self.settings.lyrics_file_path);
+        compact_rgba_controls(ui, "Current lyric", &mut self.settings.active_lyric_rgba);
 
         ui.horizontal(|ui| {
             if ui.button("Load for current song").clicked() {
@@ -1421,26 +1698,53 @@ impl MusicPlayerApp {
                 .max_rect(controls_rect),
             |ui| {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    if round_button(ui, "▶", self.font_color(), self.accent_color()).clicked() {
-                        self.play_selection();
+                    let play_pause_icon = if self.is_playing {
+                        ControlIcon::Pause
+                    } else {
+                        ControlIcon::Play
+                    };
+                    if self
+                        .icon_button(ui, play_pause_icon, self.font_color(), self.accent_color())
+                        .clicked()
+                    {
+                        if self.now_playing.is_some() {
+                            self.toggle_pause();
+                        } else {
+                            self.play_selection();
+                        }
                     }
 
-                    if round_button(ui, "Ⅱ", self.font_color(), self.accent_color()).clicked() {
-                        self.toggle_pause();
-                    }
-
-                    if round_button(ui, "◀◀", self.font_color(), self.accent_color()).clicked()
+                    if self
+                        .icon_button(
+                            ui,
+                            ControlIcon::Previous,
+                            self.font_color(),
+                            self.accent_color(),
+                        )
+                        .clicked()
                     {
                         self.play_previous();
                     }
 
-                    if round_button(ui, "▶▶", self.font_color(), self.accent_color()).clicked()
+                    if self
+                        .icon_button(
+                            ui,
+                            ControlIcon::Next,
+                            self.font_color(),
+                            self.accent_color(),
+                        )
+                        .clicked()
                     {
                         self.play_next();
                     }
 
-                    let shuffle_label = if self.shuffle { "⤨" } else { "⇄" };
-                    if round_button(ui, shuffle_label, self.font_color(), self.accent_color())
+                    if self
+                        .icon_button(
+                            ui,
+                            ControlIcon::Shuffle,
+                            self.font_color(),
+                            self.accent_color(),
+                        )
                         .clicked()
                     {
                         self.shuffle = !self.shuffle;
@@ -1453,6 +1757,52 @@ impl MusicPlayerApp {
                 });
             },
         );
+    }
+
+    fn icon_button(
+        &mut self,
+        ui: &mut Ui,
+        icon: ControlIcon,
+        font_color: Color32,
+        accent_color: Color32,
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(42.0), Sense::click());
+        let fill = if response.hovered() {
+            accent_color.gamma_multiply(1.15)
+        } else {
+            accent_color
+        };
+        ui.painter().circle_filled(rect.center(), 21.0, fill);
+
+        if let Some(texture_id) = self
+            .texture_for_control_icon(ui.ctx(), icon)
+            .map(|texture| texture.id())
+        {
+            let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(23.0));
+            Image::from_texture((texture_id, icon_rect.size()))
+                .fit_to_exact_size(icon_rect.size())
+                .paint_at(ui, icon_rect);
+        } else {
+            paint_control_icon(ui, rect, icon, font_color);
+        }
+
+        response
+    }
+
+    fn texture_for_control_icon(
+        &mut self,
+        ctx: &egui::Context,
+        icon: ControlIcon,
+    ) -> Option<&TextureHandle> {
+        let key = format!("control-icon:{}", control_icon_name(icon));
+        if !self.textures.contains_key(&key) {
+            if let Some(image) = load_control_icon_image(icon) {
+                let texture = ctx.load_texture(key.clone(), image, TextureOptions::LINEAR);
+                self.textures.insert(key.clone(), texture);
+            }
+        }
+
+        self.textures.get(&key)
     }
 
     fn scrub_bar(&mut self, ui: &mut Ui) {
@@ -1637,27 +1987,93 @@ fn selectable_row(
     response
 }
 
-fn round_button(
-    ui: &mut Ui,
-    label: &str,
-    font_color: Color32,
-    accent_color: Color32,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(42.0), Sense::click());
-    let fill = if response.hovered() {
-        accent_color.gamma_multiply(1.15)
-    } else {
-        accent_color
-    };
-    ui.painter().circle_filled(rect.center(), 21.0, fill);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(22.0),
-        font_color,
-    );
-    response
+fn paint_control_icon(ui: &mut Ui, rect: Rect, icon: ControlIcon, color: Color32) {
+    let center = rect.center();
+    match icon {
+        ControlIcon::Play => {
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    center + Vec2::new(-5.0, -9.0),
+                    center + Vec2::new(-5.0, 9.0),
+                    center + Vec2::new(10.0, 0.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        ControlIcon::Pause => {
+            let size = Vec2::new(5.0, 18.0);
+            ui.painter().rect_filled(
+                Rect::from_center_size(center + Vec2::new(-4.5, 0.0), size),
+                CornerRadius::same(1),
+                color,
+            );
+            ui.painter().rect_filled(
+                Rect::from_center_size(center + Vec2::new(4.5, 0.0), size),
+                CornerRadius::same(1),
+                color,
+            );
+        }
+        ControlIcon::Previous => {
+            paint_triangle(ui, center + Vec2::new(-4.0, 0.0), -1.0, color);
+            paint_triangle(ui, center + Vec2::new(7.0, 0.0), -1.0, color);
+        }
+        ControlIcon::Next => {
+            paint_triangle(ui, center + Vec2::new(-7.0, 0.0), 1.0, color);
+            paint_triangle(ui, center + Vec2::new(4.0, 0.0), 1.0, color);
+        }
+        ControlIcon::Shuffle => {
+            let stroke = Stroke::new(2.4, color);
+            ui.painter().line_segment(
+                [
+                    center + Vec2::new(-10.0, -6.0),
+                    center + Vec2::new(-2.0, -6.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [center + Vec2::new(-2.0, -6.0), center + Vec2::new(8.0, 6.0)],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    center + Vec2::new(-10.0, 6.0),
+                    center + Vec2::new(-2.0, 6.0),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [center + Vec2::new(-2.0, 6.0), center + Vec2::new(8.0, -6.0)],
+                stroke,
+            );
+            paint_arrow_head(ui, center + Vec2::new(8.0, 6.0), 1.0, color);
+            paint_arrow_head(ui, center + Vec2::new(8.0, -6.0), 1.0, color);
+        }
+    }
+}
+
+fn paint_triangle(ui: &mut Ui, center: Pos2, direction: f32, color: Color32) {
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            center + Vec2::new(-direction * 6.0, -8.0),
+            center + Vec2::new(-direction * 6.0, 8.0),
+            center + Vec2::new(direction * 7.0, 0.0),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+fn paint_arrow_head(ui: &mut Ui, tip: Pos2, direction: f32, color: Color32) {
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            tip + Vec2::new(-direction * 6.0, -4.0),
+            tip + Vec2::new(-direction * 6.0, 4.0),
+        ],
+        color,
+        Stroke::NONE,
+    ));
 }
 
 fn rgba_controls(ui: &mut Ui, label: &str, rgba: &mut [u8; 4]) {
@@ -1668,6 +2084,200 @@ fn rgba_controls(ui: &mut Ui, label: &str, rgba: &mut [u8; 4]) {
             ui.add(egui::DragValue::new(channel).range(0..=255).speed(1));
         }
     });
+}
+
+fn compact_rgba_controls(ui: &mut Ui, label: &str, rgba: &mut [u8; 4]) {
+    ui.label(label);
+    for row in 0..2 {
+        ui.horizontal(|ui| {
+            for index in row * 2..row * 2 + 2 {
+                ui.add_sized([12.0, 20.0], egui::Label::new(["R", "G", "B", "A"][index]));
+                ui.add_sized(
+                    [48.0, 20.0],
+                    egui::DragValue::new(&mut rgba[index])
+                        .range(0..=255)
+                        .speed(1),
+                );
+            }
+        });
+    }
+}
+
+fn paint_eq_histogram(
+    ui: &mut Ui,
+    samples: &[f32],
+    sample_rate: u32,
+    active: bool,
+    font_color: Color32,
+) {
+    let desired = Vec2::new(ui.available_width().min(640.0), 220.0);
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let chart = rect.shrink2(Vec2::new(12.0, 14.0));
+    let painter = ui.painter();
+    let rounding = CornerRadius::same(6);
+
+    painter.rect_filled(rect, rounding, Color32::from_rgb(34, 39, 43));
+    painter.rect_stroke(
+        rect,
+        rounding,
+        Stroke::new(1.0, Color32::from_rgb(82, 91, 96)),
+        egui::StrokeKind::Inside,
+    );
+
+    for db in [-72.0_f32, -60.0, -48.0, -36.0, -24.0, -12.0, 0.0] {
+        let y = level_to_y(chart, db);
+        let stroke = if (db + 36.0).abs() < f32::EPSILON {
+            Stroke::new(1.2, Color32::from_rgb(118, 132, 136))
+        } else {
+            Stroke::new(0.7, Color32::from_rgb(64, 72, 76))
+        };
+        painter.line_segment(
+            [Pos2::new(chart.left(), y), Pos2::new(chart.right(), y)],
+            stroke,
+        );
+    }
+
+    let major_freqs = [
+        20.0_f32, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
+    ];
+    for freq in major_freqs {
+        let x = freq_to_x(chart, freq);
+        painter.line_segment(
+            [Pos2::new(x, chart.top()), Pos2::new(x, chart.bottom())],
+            Stroke::new(0.7, Color32::from_rgb(55, 63, 67)),
+        );
+    }
+
+    let bin_count = ((chart.width() / 7.0).floor() as usize).clamp(24, 96);
+    let curve_count = ((chart.width() / 2.0).floor() as usize).clamp(128, 320);
+    let bar_gap = 2.0;
+    let bar_width = (chart.width() / bin_count as f32 - bar_gap).max(2.0);
+    let bottom_y = level_to_y(chart, -72.0);
+    let fill = if active {
+        Color32::from_rgb(51, 147, 156).gamma_multiply(0.78)
+    } else {
+        Color32::from_rgb(91, 104, 109).gamma_multiply(0.55)
+    };
+    let line_color = if active {
+        Color32::from_rgb(176, 226, 221)
+    } else {
+        Color32::from_rgb(145, 155, 158)
+    };
+    let magnitudes = spectrum_levels(samples, sample_rate, bin_count);
+
+    for index in 0..bin_count {
+        let t = if bin_count > 1 {
+            index as f32 / (bin_count - 1) as f32
+        } else {
+            0.0
+        };
+        let db = magnitudes.get(index).copied().unwrap_or(-72.0);
+        let x = egui::lerp(chart.x_range(), t);
+        let y = level_to_y(chart, db);
+        let bar = Rect::from_min_max(
+            Pos2::new(x - bar_width / 2.0, y),
+            Pos2::new(x + bar_width / 2.0, bottom_y),
+        );
+        painter.rect_filled(bar, CornerRadius::same(2), fill);
+    }
+
+    let curve_magnitudes = spectrum_levels(samples, sample_rate, curve_count);
+    let curve: Vec<Pos2> = curve_magnitudes
+        .iter()
+        .enumerate()
+        .map(|(index, db)| {
+            let t = if curve_count > 1 {
+                index as f32 / (curve_count - 1) as f32
+            } else {
+                0.0
+            };
+            Pos2::new(egui::lerp(chart.x_range(), t), level_to_y(chart, *db))
+        })
+        .collect();
+    painter.line(curve, Stroke::new(2.0, line_color));
+
+    for (freq, label) in [
+        (20.0, "20"),
+        (100.0, "100"),
+        (1000.0, "1k"),
+        (10000.0, "10k"),
+        (20000.0, "20k"),
+    ] {
+        painter.text(
+            Pos2::new(freq_to_x(chart, freq), rect.bottom() - 2.0),
+            egui::Align2::CENTER_BOTTOM,
+            label,
+            FontId::proportional(11.0),
+            font_color.gamma_multiply(0.7),
+        );
+    }
+
+    for (db, label) in [(0.0, "0"), (-36.0, "-36"), (-72.0, "-72")] {
+        painter.text(
+            Pos2::new(rect.right() - 4.0, level_to_y(chart, db)),
+            egui::Align2::RIGHT_CENTER,
+            label,
+            FontId::proportional(11.0),
+            font_color.gamma_multiply(0.7),
+        );
+    }
+}
+
+fn freq_to_x(rect: Rect, frequency_hz: f32) -> f32 {
+    let min = 20.0_f32.log10();
+    let max = 20_000.0_f32.log10();
+    let value = frequency_hz.clamp(20.0, 20_000.0).log10();
+    egui::lerp(rect.x_range(), (value - min) / (max - min))
+}
+
+fn level_to_y(rect: Rect, level_db: f32) -> f32 {
+    let normalized = (level_db.clamp(-72.0, 0.0) + 72.0) / 72.0;
+    egui::lerp(rect.y_range(), 1.0 - normalized)
+}
+
+fn spectrum_levels(samples: &[f32], sample_rate: u32, bin_count: usize) -> Vec<f32> {
+    if samples.len() < 256 || sample_rate == 0 {
+        return vec![-72.0; bin_count];
+    }
+
+    let window_size = samples.len().min(2048);
+    let start = samples.len().saturating_sub(window_size);
+    let window = &samples[start..];
+    let sample_rate = sample_rate as f32;
+    let nyquist = sample_rate / 2.0;
+    let max_frequency = 20_000.0_f32.min(nyquist.max(20.0));
+
+    (0..bin_count)
+        .map(|index| {
+            let t = if bin_count > 1 {
+                index as f32 / (bin_count - 1) as f32
+            } else {
+                0.0
+            };
+            let frequency = 20.0 * (max_frequency / 20.0).powf(t);
+            goertzel_level_db(window, sample_rate, frequency)
+        })
+        .collect()
+}
+
+fn goertzel_level_db(samples: &[f32], sample_rate: f32, frequency: f32) -> f32 {
+    let omega = 2.0 * std::f32::consts::PI * frequency / sample_rate;
+    let coeff = 2.0 * omega.cos();
+    let mut q1 = 0.0;
+    let mut q2 = 0.0;
+    let len = samples.len().max(1) as f32;
+
+    for (index, sample) in samples.iter().enumerate() {
+        let window =
+            0.5 - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / (len - 1.0).max(1.0)).cos();
+        let q0 = sample * window + coeff * q1 - q2;
+        q2 = q1;
+        q1 = q0;
+    }
+
+    let power = q1 * q1 + q2 * q2 - coeff * q1 * q2;
+    let magnitude = power.max(0.0).sqrt() / (len * 0.5);
+    (20.0 * magnitude.max(0.000_25).log10()).clamp(-72.0, 0.0)
 }
 
 fn setting_slider(ui: &mut Ui, label: &str, value: &mut f32, range: RangeInclusive<f32>) {
@@ -1722,10 +2332,42 @@ fn save_settings(settings: &UiSettings) -> anyhow::Result<()> {
 
 fn load_art_image(art: &ArtSource) -> Option<ColorImage> {
     let bytes = art_bytes(art)?;
-    let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let image = image::load_from_memory(&bytes)
+        .ok()?
+        .resize(512, 512, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
     let size = [image.width() as usize, image.height() as usize];
     let pixels = image.into_raw();
     Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn load_control_icon_image(icon: ControlIcon) -> Option<ColorImage> {
+    let image = image::load_from_memory(control_icon_bytes(icon))
+        .ok()?
+        .to_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let pixels = image.into_raw();
+    Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
+}
+
+fn control_icon_name(icon: ControlIcon) -> &'static str {
+    match icon {
+        ControlIcon::Play => "play",
+        ControlIcon::Pause => "pause",
+        ControlIcon::Previous => "previous",
+        ControlIcon::Next => "next",
+        ControlIcon::Shuffle => "random",
+    }
+}
+
+fn control_icon_bytes(icon: ControlIcon) -> &'static [u8] {
+    match icon {
+        ControlIcon::Play => include_bytes!("../play.ico"),
+        ControlIcon::Pause => include_bytes!("../pause.ico"),
+        ControlIcon::Previous => include_bytes!("../previous.ico"),
+        ControlIcon::Next => include_bytes!("../next.ico"),
+        ControlIcon::Shuffle => include_bytes!("../random.ico"),
+    }
 }
 
 fn load_cached_or_online_lyrics(
@@ -1788,6 +2430,53 @@ fn fetch_lrclib_lyrics(artist: &str, title: &str) -> anyhow::Result<String> {
         .find_map(|lyrics| lyrics.synced_lyrics.or(lyrics.plain_lyrics))
         .filter(|lyrics| !lyrics.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("no match found"))
+}
+
+fn parse_synced_lyrics(lyrics: &str) -> Vec<(f32, String)> {
+    let mut lines = Vec::new();
+
+    for line in lyrics.lines() {
+        let mut rest = line;
+        let mut timestamps = Vec::new();
+
+        while let Some(stripped) = rest.strip_prefix('[') {
+            let Some((timestamp, remaining)) = stripped.split_once(']') else {
+                break;
+            };
+
+            let Some(seconds) = parse_lrc_timestamp(timestamp) else {
+                break;
+            };
+
+            timestamps.push(seconds);
+            rest = remaining;
+        }
+
+        let lyric = rest.trim();
+        if lyric.is_empty() {
+            continue;
+        }
+
+        for timestamp in timestamps {
+            lines.push((timestamp, lyric.to_string()));
+        }
+    }
+
+    lines.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+    lines
+}
+
+fn parse_lrc_timestamp(timestamp: &str) -> Option<f32> {
+    let (minutes, seconds) = timestamp.split_once(':')?;
+    let minutes = minutes.parse::<f32>().ok()?;
+    let seconds = seconds.parse::<f32>().ok()?;
+    Some(minutes * 60.0 + seconds)
+}
+
+fn active_lyric_line(lines: &[(f32, String)], position: f32) -> Option<usize> {
+    lines
+        .iter()
+        .rposition(|(timestamp, _)| *timestamp <= position + 0.15)
 }
 
 fn rgba(rgba: [u8; 4]) -> Color32 {

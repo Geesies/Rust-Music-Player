@@ -1,4 +1,9 @@
-use std::{f32::consts::PI, time::Duration};
+use std::{
+    collections::VecDeque,
+    f32::consts::PI,
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 
 use rodio::{ChannelCount, SampleRate, Source};
 use serde::{Deserialize, Serialize};
@@ -26,39 +31,180 @@ pub struct EqProfile {
     pub bands: Vec<EqBand>,
 }
 
+#[derive(Clone)]
+pub struct EqControl {
+    settings: Arc<RwLock<EqRuntimeSettings>>,
+}
+
+impl EqControl {
+    pub fn new(enabled: bool, bands: Vec<EqBand>) -> Self {
+        Self {
+            settings: Arc::new(RwLock::new(EqRuntimeSettings {
+                enabled,
+                bands,
+                version: 0,
+            })),
+        }
+    }
+
+    pub fn update(&self, enabled: bool, bands: Vec<EqBand>) {
+        let Ok(mut settings) = self.settings.write() else {
+            return;
+        };
+
+        if settings.enabled != enabled || settings.bands != bands {
+            settings.enabled = enabled;
+            settings.bands = bands;
+            settings.version = settings.version.wrapping_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> Option<EqRuntimeSettings> {
+        self.settings.read().ok().map(|settings| settings.clone())
+    }
+}
+
+#[derive(Clone)]
+struct EqRuntimeSettings {
+    enabled: bool,
+    bands: Vec<EqBand>,
+    version: u64,
+}
+
+#[derive(Clone)]
+pub struct AudioAnalyzer {
+    state: Arc<Mutex<AudioAnalyzerState>>,
+}
+
+impl AudioAnalyzer {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AudioAnalyzerState {
+                samples: VecDeque::with_capacity(8192),
+                sample_rate: 44_100,
+            })),
+        }
+    }
+
+    pub fn push_samples(&self, samples: &[f32], sample_rate: SampleRate) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+
+        state.sample_rate = sample_rate;
+        for sample in samples {
+            if state.samples.len() == 8192 {
+                state.samples.pop_front();
+            }
+            state.samples.push_back(*sample);
+        }
+    }
+
+    pub fn snapshot(&self) -> AnalyzerSnapshot {
+        let Ok(state) = self.state.lock() else {
+            return AnalyzerSnapshot {
+                samples: Vec::new(),
+                sample_rate: 44_100,
+            };
+        };
+
+        AnalyzerSnapshot {
+            samples: state.samples.iter().copied().collect(),
+            sample_rate: state.sample_rate,
+        }
+    }
+}
+
+struct AudioAnalyzerState {
+    samples: VecDeque<f32>,
+    sample_rate: SampleRate,
+}
+
+pub struct AnalyzerSnapshot {
+    pub samples: Vec<f32>,
+    pub sample_rate: SampleRate,
+}
+
 pub struct EqualizerSource<I>
 where
     I: Source,
 {
     input: I,
+    control: EqControl,
+    analyzer: AudioAnalyzer,
+    settings_version: u64,
     filters: Vec<BandRuntime>,
     sample_index: usize,
+    analyzer_channel_sum: f32,
+    analyzer_frames: Vec<f32>,
 }
 
 impl<I> EqualizerSource<I>
 where
     I: Source,
 {
-    pub fn new(input: I, bands: Vec<EqBand>) -> Self {
+    pub fn new(input: I, control: EqControl, analyzer: AudioAnalyzer) -> Self {
         let channels = input.channels().max(1);
         let sample_rate = input.sample_rate();
-        let filters = bands
-            .into_iter()
-            .filter(|band| band.frequency_hz > 0.0 && band.q > 0.0 && band.gain_db.abs() > 0.01)
-            .map(|band| BandRuntime::new(&band, channels, sample_rate))
-            .collect();
+        let settings = control.snapshot();
+        let settings_version = settings
+            .as_ref()
+            .map(|settings| settings.version)
+            .unwrap_or(0);
+        let filters = settings
+            .as_ref()
+            .map(|settings| build_filters(settings, channels, sample_rate))
+            .unwrap_or_default();
 
         Self {
             input,
+            control,
+            analyzer,
+            settings_version,
             filters,
             sample_index: 0,
+            analyzer_channel_sum: 0.0,
+            analyzer_frames: Vec::with_capacity(512),
         }
+    }
+
+    fn refresh_filters(&mut self) {
+        let Some(settings) = self.control.snapshot() else {
+            return;
+        };
+
+        if settings.version == self.settings_version {
+            return;
+        }
+
+        self.filters = build_filters(&settings, self.channels().max(1), self.sample_rate());
+        self.settings_version = settings.version;
+        self.reset();
     }
 
     fn reset(&mut self) {
         self.sample_index = 0;
         for filter in &mut self.filters {
             filter.reset();
+        }
+        self.analyzer_channel_sum = 0.0;
+        self.analyzer_frames.clear();
+    }
+
+    fn analyze_sample(&mut self, channel: usize, sample: f32) {
+        let channels = usize::from(self.channels().max(1));
+        self.analyzer_channel_sum += sample;
+
+        if channel + 1 == channels {
+            self.analyzer_frames
+                .push((self.analyzer_channel_sum / channels as f32).clamp(-1.0, 1.0));
+            self.analyzer_channel_sum = 0.0;
+        }
+
+        if self.analyzer_frames.len() >= 512 {
+            self.analyzer
+                .push_samples(&self.analyzer_frames, self.sample_rate());
+            self.analyzer_frames.clear();
         }
     }
 }
@@ -70,6 +216,10 @@ where
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.sample_index % 2048 == 0 {
+            self.refresh_filters();
+        }
+
         let mut sample = self.input.next()?;
         let channel = self.sample_index % usize::from(self.channels().max(1));
 
@@ -77,8 +227,10 @@ where
             sample = filter.process(channel, sample);
         }
 
+        sample = sample.clamp(-1.0, 1.0);
+        self.analyze_sample(channel, sample);
         self.sample_index = self.sample_index.wrapping_add(1);
-        Some(sample.clamp(-1.0, 1.0))
+        Some(sample)
     }
 }
 
@@ -107,6 +259,23 @@ where
         self.reset();
         Ok(())
     }
+}
+
+fn build_filters(
+    settings: &EqRuntimeSettings,
+    channels: ChannelCount,
+    sample_rate: SampleRate,
+) -> Vec<BandRuntime> {
+    if !settings.enabled {
+        return Vec::new();
+    }
+
+    settings
+        .bands
+        .iter()
+        .filter(|band| band.frequency_hz > 0.0 && band.q > 0.0 && band.gain_db.abs() > 0.01)
+        .map(|band| BandRuntime::new(band, channels, sample_rate))
+        .collect()
 }
 
 struct BandRuntime {
